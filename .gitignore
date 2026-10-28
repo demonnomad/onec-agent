@@ -1,0 +1,6 @@
+server/data/
+server/logs/
+.venv/
+__pycache__/
+server/sources.json
+server/evals/*.local.json
