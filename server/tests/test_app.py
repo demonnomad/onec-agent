@@ -1,5 +1,6 @@
 """WebSocket сервера: приветствие, модель базы, права на настройки."""
 import asyncio
+import sys
 
 import aiohttp
 from aiohttp import web
@@ -93,5 +94,6 @@ def test_token_file_created_once(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "TOKEN_FILE", str(tmp_path / "data" / "token"))
     first = auth.token()
     assert len(first) >= 24 and auth.token() == first
-    assert oct(os.stat(tmp_path / "data" / "token").st_mode)[-3:] == "600"
+    if sys.platform != "win32":  # на Windows POSIX-прав нет — файл защищает ACL каталога пользователя
+        assert oct(os.stat(tmp_path / "data" / "token").st_mode)[-3:] == "600"
     assert auth.check(first) and not auth.check("") and not auth.check(None)

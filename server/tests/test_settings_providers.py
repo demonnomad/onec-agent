@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import sys
 
 import aiohttp
 import pytest
@@ -29,7 +30,8 @@ def test_empty_key_keeps_previous_and_is_not_shown():
     assert again["api_key"] == "sk-1"
     shown = settings.public(again)
     assert "api_key" not in shown and shown["has_key"] and shown["cloud"]
-    assert oct(os.stat(config.MODELS_FILE).st_mode & 0o777) == "0o600"
+    if sys.platform != "win32":  # на Windows POSIX-прав нет
+        assert oct(os.stat(config.MODELS_FILE).st_mode & 0o777) == "0o600"
 
 
 def test_default_profile_is_local():
