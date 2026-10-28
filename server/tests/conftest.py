@@ -15,10 +15,12 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "AUDIT_LOG", str(tmp_path / "logs" / "audit.jsonl"))
     monkeypatch.setattr(audit, "LOG", tmp_path / "logs" / "audit.jsonl")
     monkeypatch.setattr(config, "MODELS_FILE", str(tmp_path / "data" / "models.json"))
-    monkeypatch.setattr(config, "KB_DIR", str(tmp_path / "kb"))
-    monkeypatch.setattr(config, "SOURCES_FILE", str(tmp_path / "sources.json"))
     monkeypatch.setattr(config, "UPLOAD_DIR", str(tmp_path / "uploads"))
     monkeypatch.setattr(config, "TOKEN", "тестовый-токен")
+    monkeypatch.setattr(config, "MODELS_DIR", str(tmp_path / "data" / "models"))
+    monkeypatch.setattr(config, "LOCAL_MODEL_SETTINGS", str(tmp_path / "data" / "local_model.json"))
+    monkeypatch.setattr(config, "LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr(config, "BASES_FILE", str(tmp_path / "data" / "bases.json"))
     monkeypatch.setattr(config, "TOKEN_FILE", str(tmp_path / "data" / "token"))
     return tmp_path
 

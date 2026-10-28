@@ -135,3 +135,15 @@ def test_gigachat_schemas_get_properties():
     assert fixed["properties"]["items"]["items"]["properties"] == {}
     assert fixed["properties"]["who"]["type"] == "string"
     assert schema["properties"]["params"] == {"type": "object"}  # исходная схема не изменена
+
+
+def test_session_picks_up_profile_saved_elsewhere(session):
+    """Профиль сменили из другого чата или приложения — открытый чат берёт его перед ходом и обновляет шапку."""
+    assert session.profile["provider"] == "local"
+    settings.save(session.base_id, settings.merge(session.base_id, {"provider": "openai", "api_key": "k", "model": "m",
+                                                                    "cloud_consent": True}, "Админ"))
+    asyncio.run(session.refresh_profile())
+    assert session.profile["provider"] == "openai" and session.client.kind == "openai"
+    assert session.events[-1]["type"] == "model" and session.events[-1]["label"].startswith("облако")
+    asyncio.run(session.refresh_profile())  # без изменений — шапку не трогаем
+    assert len(session.events) == 1

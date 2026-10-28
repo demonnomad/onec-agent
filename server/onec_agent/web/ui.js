@@ -29,8 +29,8 @@
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* хранилище недоступно — не страшно */ } },
   };
   function applyTheme(t) { document.documentElement.setAttribute("data-theme", t); }
-  const prefersLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
-  applyTheme(store.get("onec-agent-theme") || (prefersLight ? "light" : "dark"));
+  // По умолчанию — светлая тема в духе «Такси» (чат живёт внутри 1С); тёмная — по кнопке ◐ или /тема.
+  applyTheme(store.get("onec-agent-theme") || "light");
 
   // ---------- каркас ----------
   const css = document.createElement("link");
@@ -42,7 +42,7 @@
     '<span class="logo">◆ <span>ИИ-консультант</span></span>' +
     '<span id="meta">подключение…</span>' +
     '<button class="icon-btn" id="gear" title="Настройки модели" hidden>⚙</button>' +
-    '<button class="icon-btn" id="theme" title="Светлая / тёмная тема">◐</button>' +
+    '<button class="icon-btn" id="theme" title="Тема: 1С (светлая) / тёмная">◐</button>' +
     '<button class="icon-btn" id="help" title="Справка">?</button></div>' +
     '<div id="log"></div>' +
     '<div id="files"></div>' +
@@ -494,12 +494,12 @@
   const HELP = [
     "**Команды**",
     "- `/новый` — начать новый диалог",
-    "- `/тема` — переключить светлую / тёмную тему",
+    "- `/тема` — переключить тему: светлая как в 1С / тёмная",
     "- `/помощь` — эта справка",
     "",
     "**Файлы**: 📎, перетащите в окно или вставьте скриншот через Ctrl+V. Скриншоты, Excel, PDF, Word, CSV, текст — до 20 МБ.",
     "",
-    "**/тесты** — прогнать тестовый набор: числа сверяются с эталоном-запросом, поведение — по правилам (какие шаги, без лишних действий). `/тесты числа`, `/тесты поведение` — по отдельности; действия в прогоне не выполняются.",
+    "**/тесты** — прогнать тестовый набор: числа сверяются с эталоном-запросом, поведение — по правилам (какие шаги, без лишних действий). `/тесты числа`, `/тесты поведение` — по отдельности, `/тесты b_ext` — тесты с таким началом id; действия в прогоне не выполняются.",
     "",
     "Нажмите на шаг агента, чтобы увидеть запрос и результат. Действия, меняющие данные, подтверждаются в окне 1С.",
   ].join("\n");

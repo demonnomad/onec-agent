@@ -8,14 +8,15 @@
   --kw: #c792ea; --str: #a5d6a7; --num: #f2b880; --cmt: #6b717b;
   --shadow: 0 6px 24px rgba(0, 0, 0, .35);
 }
+/* Светлая тема — «Такси» 1С: белый фон, жёлтые акценты, серые линии, системный шрифт как в самой 1С. */
 :root[data-theme="light"] {
-  --bg: #f6f6f4; --panel: #ffffff; --panel-2: #f0f0ed; --line: #e2e2dd; --line-2: #d3d3cc;
-  --fg: #26282c; --dim: #6b7079; --faint: #9a9fa7;
-  --accent: #b7791f; --accent-soft: rgba(183, 121, 31, .1);
-  --ok: #2f8a43; --err: #c23b40; --info: #2f6db3; --wait: #b7791f;
-  --user: #7044b8; --code: #f3f3f0; --sel: rgba(47, 109, 179, .18);
-  --kw: #8a3fbf; --str: #2f7d3a; --num: #a35a12; --cmt: #8b9099;
-  --shadow: 0 6px 24px rgba(0, 0, 0, .1);
+  --bg: #ffffff; --panel: #ffffff; --panel-2: #f4f4f2; --line: #d9d9d9; --line-2: #c4c4c4;
+  --fg: #333333; --dim: #6e6e6e; --faint: #9a9a9a;
+  --accent: #b58900; --accent-soft: rgba(255, 210, 30, .28); --yellow: #ffd21e; --yellow-soft: #fff6cc;
+  --ok: #2e8b3d; --err: #d0342c; --info: #0066b3; --wait: #b58900;
+  --user: #333333; --code: #f7f7f5; --sel: #ffe99a;
+  --kw: #7a3fb0; --str: #2f7d3a; --num: #a35a12; --cmt: #8b9099;
+  --shadow: 0 6px 24px rgba(0, 0, 0, .12);
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
@@ -160,6 +161,23 @@ table.t td.n, table.t th.n { text-align: right; font-variant-numeric: tabular-nu
 #app.drop::after { content: "Отпустите, чтобы прикрепить файлы"; position: fixed; inset: 10px; border: 2px dashed var(--accent);
   border-radius: 12px; background: color-mix(in srgb, var(--bg) 85%, transparent); display: flex; align-items: center;
   justify-content: center; color: var(--accent); font-size: 15px; pointer-events: none; }
+
+/* ---------- светлая тема: детали в духе 1С ---------- */
+:root[data-theme="light"] body { font-family: -apple-system, "Segoe UI", Arial, "Helvetica Neue", sans-serif; font-size: 13px; }
+:root[data-theme="light"] .md code, :root[data-theme="light"] .md pre, :root[data-theme="light"] .tool .body,
+:root[data-theme="light"] table.t { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; }
+:root[data-theme="light"] #top { border-bottom: 2px solid var(--yellow); }
+:root[data-theme="light"] .user { background: var(--yellow-soft); border-color: #f0dc8a; }
+:root[data-theme="light"] .user::before { color: #a07c00; }
+:root[data-theme="light"] #send { background: var(--yellow); border-color: #e6bc14; color: #333; }
+:root[data-theme="light"] #bar:focus-within { border-color: #e6bc14; box-shadow: 0 0 0 3px var(--accent-soft); }
+:root[data-theme="light"] .welcome .ex button:hover { border-color: #e6bc14; background: var(--yellow-soft); }
+:root[data-theme="light"] .ask-opt { border-color: #e6bc14; }
+:root[data-theme="light"] .ask-opt:hover:not(:disabled), :root[data-theme="light"] .ask-opt.chosen { background: var(--yellow-soft); }
+:root[data-theme="light"] .doc { border-left-color: var(--yellow); }
+:root[data-theme="light"] .btn.primary { border-color: #e6bc14; color: #333; background: var(--yellow-soft); }
+:root[data-theme="light"] .md a, :root[data-theme="light"] .tool .title a { color: var(--info); }
+:root[data-theme="light"] #log::-webkit-scrollbar-thumb { background: #cfcfcf; border-color: #fff; }
 
 @keyframes fadein { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 @keyframes spin { to { transform: rotate(360deg); } }

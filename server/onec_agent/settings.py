@@ -60,6 +60,9 @@ def merge(base_id: str, incoming: dict, user: str, for_test: bool = False) -> di
     profile["provider"] = provider
     profile.setdefault("base_url", info["base_url"])
     profile.setdefault("model", info["model"])
+    if provider == "builtin":  # модель выбирается в приложении, а не в 1С
+        from .local_model import settings as local_settings
+        profile["model"] = local_settings()["preset"]
     if not profile["model"]:
         raise ValueError("Укажите модель")
     key = (incoming.get("api_key") or "").strip()

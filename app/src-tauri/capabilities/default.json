@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Панель открывается с локального сервера; доступа к API Tauri ей не нужно",
+  "windows": [],
+  "permissions": []
+}

@@ -13,9 +13,9 @@ import re
 import time
 from pathlib import Path
 
-from . import config, providers
+from . import config, files, providers
 
-EVALS_DIR = Path(__file__).parent.parent / "evals"
+EVALS_DIR = Path(config.EVALS_DIR)
 NUMBER = re.compile(r"-?(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?:[.,]\d+)?")
 
 
@@ -68,7 +68,8 @@ def answer_numbers(text: str) -> list[float]:
 
 
 # Нулевой эталон модель часто называет словами: «дебетовое сальдо отсутствует», «ничего не должны».
-ZERO_WORDS = re.compile(r"ноль|нулев|равно нулю|отсутству|ничего не долж|не должны|нет долга|долга нет", re.IGNORECASE)
+ZERO_WORDS = re.compile(r"ноль|нулев|равно нулю|отсутству|ничего не долж|не должны|нет долга|долга нет|не зарегистрир"
+                        r"|не выдан|не выставл|не было|не найден|не обнаружен|нет ни одн", re.IGNORECASE)
 
 
 def check(expected: list[float], answer: str) -> tuple[bool, list[float]]:
@@ -86,7 +87,7 @@ def fmt(x: float) -> str:
 
 # Инструменты, которые в тестовом прогоне не выполняются: меняют данные или открывают формы у пользователя.
 DRY_RUN_TOOLS = {"invoice_create", "sale_create", "purchase_create", "create_based_on", "object_create",
-                 "object_update", "document_post", "document_unpost", "open_list", "ui_open"}
+                 "object_update", "document_post", "document_unpost", "open_list", "ui_open", "month_close_run"}
 
 
 def _numbers_in(value) -> set[float]:
@@ -100,6 +101,10 @@ def _numbers_in(value) -> set[float]:
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
         found.add(float(value))
     return found
+
+
+# Уточнение без знака вопроса: «Уточните, пожалуйста, по какому счёту…», «Укажите период».
+ASK_WORDS = re.compile(r"^\s*(уточните|укажите|назовите|подскажите)\b", re.IGNORECASE | re.MULTILINE)
 
 
 def check_behavior(checks: dict, tools: list[str], answer: str, actions: list | None = None) -> list[str]:
@@ -118,16 +123,23 @@ def check_behavior(checks: dict, tools: list[str], answer: str, actions: list | 
             fails.append("попытка действия без запроса: " + ", ".join(used))
     if checks.get("max_steps") is not None and len(tools) > checks["max_steps"]:
         fails.append(f"шагов {len(tools)} при лимите {checks['max_steps']}")
-    if checks.get("must_ask") and "?" not in answer and "ask_user" not in tools:
+    if checks.get("must_ask") and "?" not in answer and "ask_user" not in tools and not ASK_WORDS.search(answer):
         fails.append("нет уточняющего вопроса")
     for spec in checks.get("action_numbers") or []:
         # Действие вызвано именно с названными пользователем числами (например, 2 шт по 3000).
         calls = [a for name, a in actions if name == spec["tool"]]
         if not any(set(spec["numbers"]) <= _numbers_in(a) for a in calls):
             fails.append(f"{spec['tool']} не вызван с числами {spec['numbers']}")
+    for spec in checks.get("expect_args") or []:
+        # Инструмент вызван с нужным аргументом (например, object_find с отбором filters).
+        if not any(name == spec["tool"] and a.get(spec["has"]) for name, a in actions):
+            fails.append(f"{spec['tool']} не вызван с {spec['has']}")
     wanted = checks.get("answer_any") or []
     if wanted and not any(re.search(w, answer, re.IGNORECASE) for w in wanted):
         fails.append("в ответе нет ничего из: " + " | ".join(wanted))
+    for want in checks.get("answer_all") or []:
+        if not re.search(want, answer, re.IGNORECASE):
+            fails.append(f"в ответе нет: «{want}»")
     for bad in checks.get("answer_none") or []:
         if re.search(bad, answer, re.IGNORECASE):
             fails.append(f"в ответе недопустимое: «{bad}»")
@@ -136,7 +148,7 @@ def check_behavior(checks: dict, tools: list[str], answer: str, actions: list | 
 
 async def run(session, emit, only: str | None = None) -> None:
     """Прогоняет набор для конфигурации сессии. emit — исходный канал в интерфейс.
-    only: «числа» — только сверка с эталоном, «поведение» — только поведенческие тесты."""
+    only: «числа» — только сверка с эталоном, «поведение» — только поведенческие тесты, иначе — начало id тестов."""
     config_name = session.context.get("config_name", "")
     suite = load_suite(config_name)
     for variant in suite_variants(config_name):
@@ -149,7 +161,9 @@ async def run(session, emit, only: str | None = None) -> None:
             await emit({"type": "text_delta", "text": f"Набор тестов: {variant['file']}\n"})
             break
     cases = suite.get("cases", [])
-    if only:
+    if only and any(c["id"].startswith(only) for c in cases):
+        cases = [c for c in cases if c["id"].startswith(only)]  # /тесты b_ext — тесты с таким началом id
+    elif only:
         behavior = only.startswith("повед") or only.startswith("behav")
         cases = [c for c in cases if ("checks" in c or "turns" in c) == behavior]
     if not cases:
@@ -159,16 +173,21 @@ async def run(session, emit, only: str | None = None) -> None:
 
     answer_parts: list[str] = []
 
+    turn_errors: list[str] = []
+
     async def quiet_emit(event: dict) -> None:
         # Внутренние ходы агента показываем, но их turn_done не завершает весь прогон в интерфейсе.
         if event.get("type") == "turn_done":
             return
         if event.get("type") == "text_delta":
             answer_parts.append(event["text"])
+        if event.get("type") == "error":
+            turn_errors.append(str(event.get("message", ""))[:120])
         await emit(event)
 
     session.stop_requested = False
     session.dry_run_tools = DRY_RUN_TOOLS
+    temp_session = ""  # вложения тестов складываются во временную сессию файлов
     original_emit = session.emit
     session.emit = quiet_emit
     results = []
@@ -209,23 +228,37 @@ async def run(session, emit, only: str | None = None) -> None:
                 expected = expected_numbers(ref["result"])
 
             session.reset()
+            session.asked = []
             started = time.time()
-            fails, tools, answer = [], [], ""
+            fails, tools, guarded, notes, answer = [], [], [], [], ""
             # Многоходовой сценарий — реплики одного диалога; правила проверяются на каждом ходе.
-            turns = case.get("turns") or [{"question": case["question"], "checks": case.get("checks")}]
+            turns = case.get("turns") or [{"question": case["question"], "checks": case.get("checks"), "file": case.get("file")}]
             for n, step in enumerate(turns, 1):
                 if n > 1:
                     await emit({"type": "text_delta", "text": f"\n› {step['question']}\n"})
                     await emit({"type": "text_end"})
                 answer_parts.clear()
-                mark = len(session.messages)
-                session.start_turn(step["question"])
+                turn_errors.clear()
+                mark, asked_before = len(session.messages), len(session.asked)
+                attachments = []
+                if step.get("file"):  # вложение к вопросу — как если бы пользователь приложил файл
+                    if not session.session_id:
+                        session.session_id = f"eval-{int(time.time())}"
+                        temp_session = session.session_id
+                    meta = await files.save_upload(session.http, session.session_id, step["file"]["name"],
+                                                   step["file"]["text"].encode("utf-8"))
+                    attachments.append(meta["id"])
+                session.start_turn(step["question"], attachments)
                 await session.turn
                 if session.stop_requested:
                     raise asyncio.CancelledError
                 answer = "".join(answer_parts)
                 calls = [c for m in session.messages[mark:] if m.get("role") == "assistant"
                          for c in (m.get("tool_calls") or [])]
+                # Действие, которое перехватила защита, до 1С не дошло — пользователь диалога не видел.
+                # Это не нарушение, но слабое место модели: показываем отдельно.
+                guarded += [c["function"]["name"] for c in calls if c["id"] in session.guarded_ids]
+                calls = [c for c in calls if c["id"] not in session.guarded_ids]
                 turn_tools = [c["function"]["name"] for c in calls]
                 tools += turn_tools
                 actions = []
@@ -235,15 +268,25 @@ async def run(session, emit, only: str | None = None) -> None:
                     except json.JSONDecodeError:
                         pass
                 prefix = f"ход {n}: " if len(turns) > 1 else ""
+                fails += [prefix + "ход прерван: " + e for e in turn_errors]
                 if step.get("checks"):
-                    fails += [prefix + f for f in check_behavior(step["checks"], turn_tools, answer, actions)]
+                    # Варианты-кнопки — часть ответа: «Павел или Мария?» может быть кнопками при коротком вопросе.
+                    buttons = " ".join(" ".join(q["options"]) for q in session.asked[asked_before:])
+                    fails += [prefix + f for f in check_behavior(step["checks"], turn_tools, answer + "\n" + buttons, actions)]
+                    if step["checks"].get("must_ask") and "ask_user" not in turn_tools:
+                        notes.append(prefix + "вопрос текстом, без кнопок ask_user")
             if expected is not None:
                 passed, missing = check(expected, answer)
                 if not passed:
                     fails.append("нет в ответе: " + ", ".join(fmt(m) for m in missing))
             results.append({"id": case["id"], "ok": not fails, "fails": fails, "expected": expected, "tools": tools,
+                            "guarded": guarded, "notes": notes, "asked": list(session.asked),
                             "seconds": round(time.time() - started), "steps": len(tools), "answer": answer})
             verdict = "✅ верно" if not fails else "❌ " + "; ".join(fails)
+            if guarded:
+                verdict += " · 🛡 перехвачено защитой: " + ", ".join(guarded)
+            if notes:
+                verdict += " · ✎ " + "; ".join(notes)
             tail = f" · эталон: {', '.join(fmt(e) for e in expected)}" if expected is not None else f" · шаги: {', '.join(tools) or '—'}"
             await emit({"type": "text_end"})
             await emit({"type": "text_delta", "text": f"\n**{verdict}**{tail}\n"})
@@ -264,11 +307,22 @@ async def run(session, emit, only: str | None = None) -> None:
     finally:
         session.emit = original_emit
         session.dry_run_tools = set()
+        if temp_session:
+            files.drop_session(temp_session)
+            session.session_id = ""
 
     passed = sum(r["ok"] for r in results)
-    lines = [f"\n## Итог: {passed} из {len(results)}\n", "| Тест | Результат | Время | Шагов |", "|---|---|---|---|"]
+    lines = [f"\n## Итог: {passed} из {len(results)}\n", "| Тест | Результат | Время | Шагов | 🛡 |", "|---|---|---|---|---|"]
     for r in results:
-        lines.append(f"| {r['id']} | {'✅' if r['ok'] else '❌'} | {r.get('seconds', '—')} с | {r.get('steps', '—')} |")
+        lines.append(f"| {r['id']} | {'✅' if r['ok'] else '❌'} | {r.get('seconds', '—')} с | {r.get('steps', '—')} | "
+                     f"{len(r.get('guarded') or []) or ''} |")
+    # Перехваты защитой — не провал, но мера того, насколько модель действует раньше, чем спрашивает.
+    shielded = [r for r in results if r.get("guarded")]
+    lines.append(f"\nДействий перехвачено защитой: {sum(len(r['guarded']) for r in shielded)}"
+                 + (" (" + ", ".join(r["id"] for r in shielded) + ")" if shielded else ""))
+    texted = [r for r in results if r.get("notes")]
+    if texted:
+        lines.append("Уточнения текстом, без кнопок: " + ", ".join(r["id"] for r in texted))
     await emit({"type": "text_delta", "text": "\n".join(lines) + "\n"})
 
     log_dir = Path(config.AUDIT_LOG).parent / "evals"

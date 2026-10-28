@@ -64,9 +64,11 @@
 		<ChildObjects>
 			<Language>Русский</Language>
 			<Subsystem>иик_ИИКонсультант</Subsystem>
+			<CommonTemplate>иик_БазаЗнаний</CommonTemplate>
 			<CommonModule>иик_Инструменты</CommonModule>
 			<CommonCommand>иик_ИИКонсультант</CommonCommand>
 			<CommonForm>иик_Консультант</CommonForm>
+			<InformationRegister>иик_ИсходныйКод</InformationRegister>
 		</ChildObjects>
 	</Configuration>
 </MetaDataObject>

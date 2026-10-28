@@ -19,6 +19,11 @@ PROVIDERS = {
         "cloud": False, "needs_key": False,
         "base_url": config.LLM_BASE_URL, "model": config.LLM_MODEL,
     },
+    "builtin": {
+        "title": "Встроенная модель (llama.cpp в приложении onec-agent)",
+        "cloud": False, "needs_key": False,
+        "base_url": "", "model": "",
+    },
     "openai": {
         "title": "OpenAI-совместимый API (OpenAI, DeepSeek, OpenRouter, YandexGPT…)",
         "cloud": True, "needs_key": True,
@@ -63,6 +68,9 @@ def is_cloud(profile: dict) -> bool:
 def label(profile: dict) -> str:
     """Для шапки чата: куда уходят данные и какая модель."""
     info = PROVIDERS.get(profile.get("provider"), PROVIDERS["local"])
+    if profile.get("provider") == "builtin":
+        from .local_model import settings as local_settings
+        return f"встроенная модель · {local_settings()['preset']}"
     where = "облако · " + info["title"].split(" (")[0] if info["cloud"] else "свой сервер"
     return f"{where} · {profile.get('model') or info['model'] or '?'}"
 
@@ -90,8 +98,23 @@ class Client:
             return self._anthropic(http, messages, tools)
         if self.kind == "gigachat":
             return self._gigachat(http, messages, tools)
+        if self.kind == "builtin":
+            return self._builtin(http, messages, tools)
         return llm.stream_chat(http, messages, tools, base_url=self.base_url, model=self.model,
                                api_key=self.profile.get("api_key") or config.LLM_API_KEY)
+
+    # ---------- встроенная модель ----------
+
+    async def _builtin(self, http, messages, tools):
+        from .local_model import LocalModelError, manager
+        try:
+            base_url = await manager.ensure_running()
+        except LocalModelError as exc:
+            raise ProviderError(str(exc)) from exc
+        async for event in llm.stream_chat(http, messages, tools, base_url=base_url,
+                                           model=manager.loaded_preset or "local", api_key="none"):
+            manager.last_used = time.time()
+            yield event
 
     # ---------- Anthropic Messages API ----------
 

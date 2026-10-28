@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>onec-agent</title>
+<style>
+  :root { --bg: #1e1f22; --panel: #2b2d31; --line: #3a3d43; --text: #dfe1e5; --dim: #8b8e94;
+          --accent: #e8a33d; --ok: #5fb878; --err: #e06c75; }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 13px -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 14px 18px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px; }
+  header b { font-size: 15px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); }
+  .dot.ready { background: var(--ok); } .dot.starting { background: var(--accent); } .dot.error { background: var(--err); }
+  main { padding: 16px 18px; display: grid; gap: 14px; max-width: 720px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+  h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); }
+  .row { display: flex; align-items: center; gap: 10px; margin: 6px 0; flex-wrap: wrap; }
+  .grow { flex: 1; }
+  .muted { color: var(--dim); }
+  .err { color: var(--err); }
+  button { background: #3a3d43; color: var(--text); border: 1px solid #4a4d55; border-radius: 6px;
+           padding: 6px 12px; font: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); color: #1e1f22; border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  label { display: grid; gap: 4px; color: var(--dim); }
+  input, select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+                  padding: 6px 8px; font: inherit; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .preset { border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin: 6px 0; }
+  .preset.active { border-color: var(--accent); }
+  .base { border-top: 1px solid var(--line); padding: 8px 0; }
+  .base:first-child { border-top: 0; }
+  pre.log { background: var(--bg); border-radius: 6px; padding: 8px; margin: 6px 0 0; max-height: 160px; overflow: auto;
+            font: 11px Menlo, monospace; color: var(--dim); white-space: pre-wrap; }
+  progress { width: 100%; height: 6px; accent-color: var(--accent); }
+  code { background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header><span class="dot" id="dot"></span><b>onec-agent</b><span class="muted" id="headline">…</span></header>
+<main>
+  <section id="login" hidden>
+    <h2>Токен доступа</h2>
+    <div class="muted">Он в файле <code>server/data/token</code> на этом компьютере.</div>
+    <div class="row"><input class="grow" type="password" id="tokenInput" placeholder="токен"><button class="primary" id="tokenSave">Войти</button></div>
+  </section>
+  <section>
+    <h2>Встроенная модель</h2>
+    <div id="presets"></div>
+    <div class="row" id="dl" hidden><progress id="dlbar" max="100"></progress></div>
+    <div class="row"><span class="grow muted" id="dltext"></span></div>
+    <div class="row">
+      <button class="primary" id="start">Запустить</button>
+      <button id="stop">Остановить</button>
+      <span class="grow"></span><span class="muted" id="mem"></span>
+    </div>
+    <div class="row err" id="error"></div>
+  </section>
+  <section>
+    <h2>Настройки модели</h2>
+    <div class="grid">
+      <label>Контекст, токенов<input type="number" id="ctx" step="1024" min="2048"></label>
+      <label>Параллельных запросов<input type="number" id="parallel" min="1" max="8"></label>
+      <label>Слоёв на GPU (0 — только CPU)<input type="number" id="gpu_layers" min="0" max="999"></label>
+      <label>Выгружать после простоя, мин (0 — нет)<input type="number" id="idle_unload_min" min="0"></label>
+      <label>Запускать при первом запросе<select id="autostart"><option value="true">да</option><option value="false">нет</option></select></label>
+    </div>
+    <div class="row"><button id="save">Сохранить</button><span class="muted" id="saved"></span></div>
+    <div class="muted">Новые контекст и параллельность применяются при следующем запуске модели.</div>
+  </section>
+  <section>
+    <h2>Базы 1С — исходники для чтения кода</h2>
+    <div class="muted">Консультант читает код конфигурации (ошибки «Модуль(строка)», поиск по коду) из базы: выгрузите
+      исходники один раз и после обновления конфигурации. В базе должно стоять расширение консультанта.
+      Опубликованную через ibsrv базу приложение остановит на время выгрузки и запустит снова.</div>
+    <div id="bases"></div>
+    <div class="row">
+      <input class="grow" id="newPath" placeholder="Путь к файловой базе (каталог с 1Cv8.1CD)">
+      <input id="newUser" placeholder="Пользователь 1С" style="width:150px">
+      <button id="addBase">Добавить</button>
+    </div>
+    <div class="row err" id="basesError"></div>
+  </section>
+  <section>
+    <h2>Подключение 1С</h2>
+    <div class="muted">В 1С: «ИИ-консультант» → «Настройки модели» → источник «Встроенная модель».
+      Адрес модели для других программ: <code id="endpoint"></code></div>
+  </section>
+</main>
+<script>
+  // Токен передаёт окно приложения (Tauri) до загрузки страницы; для отладки — /panel#token=…
+  // В обычном браузере — поле ввода; токен живёт только в этой вкладке (sessionStorage), не в адресе.
+  let token = window.__AGENT_TOKEN__ || (location.hash.match(/token=([^&]+)/) || [])[1]
+    || sessionStorage.getItem("onec-agent-token") || "";
+  const $ = (id) => document.getElementById(id);
+  let status = null, selected = null;
+
+  async function api(path, body) {
+    const resp = await fetch("/panel/api/" + path, {
+      method: body === undefined ? "GET" : "POST",
+      headers: { "X-Agent-Token": token, "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || "ошибка");
+    return data;
+  }
+  const gb = (b) => (b / 1e9).toFixed(1) + " ГБ";
+
+  function render(s) {
+    status = s;
+    selected = selected || s.settings.preset;
+    $("dot").className = "dot " + s.state;
+    const names = { ready: "модель работает", starting: "модель загружается…", stopped: "модель остановлена", error: "ошибка" };
+    $("headline").textContent = names[s.state] + (s.preset ? " · " + s.preset : "") + " · память компьютера " + s.ram_gb + " ГБ";
+    $("presets").innerHTML = s.presets.map((p) => {
+      const low = s.ram_gb && s.ram_gb < p.min_ram_gb ? ` <span class="err">нужно от ${p.min_ram_gb} ГБ памяти</span>` : "";
+      return `<div class="preset ${p.id === selected ? "active" : ""}" data-id="${p.id}">
+        <div class="row"><input type="radio" name="preset" ${p.id === selected ? "checked" : ""}>
+        <b class="grow">${p.title}</b><span class="muted">${p.size_gb} ГБ</span></div>
+        <div class="muted">${p.note}${low}</div>
+        <div class="row">${p.downloaded ? '<span class="muted">✓ скачана</span>'
+          : `<button data-dl="${p.id}">Скачать</button>`}</div></div>`;
+    }).join("");
+    document.querySelectorAll(".preset").forEach((el) => el.onclick = (e) => {
+      if (e.target.dataset.dl) return;
+      selected = el.dataset.id; render(status);
+    });
+    document.querySelectorAll("[data-dl]").forEach((b) => b.onclick = () => act("model/download", { preset: b.dataset.dl }));
+    const d = s.download;
+    $("dl").hidden = !(d && ["running", "verifying"].includes(d.state));
+    if (d) {
+      $("dlbar").value = d.total ? (100 * d.done) / d.total : 0;
+      const text = { running: `Скачиваю ${gb(d.done)} из ${gb(d.total)}` + (d.speed ? `, ${(d.speed / 1e6).toFixed(1)} МБ/с` : ""),
+                     verifying: "Проверяю контрольную сумму…", done: "Модель скачана", cancelled: "Загрузка отменена",
+                     error: "Ошибка загрузки: " + d.error }[d.state] || "";
+      $("dltext").innerHTML = text + (d.state === "running" ? ' <button id="cancel">Отменить</button>' : "");
+      if ($("cancel")) $("cancel").onclick = () => act("model/cancel", {});
+    }
+    const chosen = s.presets.find((p) => p.id === selected);
+    $("start").disabled = !chosen || !chosen.downloaded || s.state === "starting" || !s.binary
+      || (s.state === "ready" && s.preset === selected);
+    $("stop").disabled = s.state !== "ready" && s.state !== "starting";
+    $("mem").textContent = s.memory_mb ? `занято памяти: ${(s.memory_mb / 1024).toFixed(1)} ГБ` : "";
+    $("error").textContent = !s.binary ? "Не найден llama-server (llama.cpp) — установите его." : s.error || "";
+    $("endpoint").textContent = s.endpoint;
+    for (const k of ["ctx", "parallel", "gpu_layers", "idle_unload_min"])
+      if (document.activeElement !== $(k)) $(k).value = s.settings[k];
+    if (document.activeElement !== $("autostart")) $("autostart").value = String(s.settings.autostart);
+  }
+
+  async function act(path, body) {
+    try { render(await api(path, body)); $("error").textContent = ""; }
+    catch (e) { $("error").textContent = e.message; }
+  }
+  $("start").onclick = () => act("model/start", { preset: selected });
+  $("stop").onclick = () => act("model/stop", {});
+  $("save").onclick = async () => {
+    const body = { autostart: $("autostart").value === "true" };
+    for (const k of ["ctx", "parallel", "gpu_layers", "idle_unload_min"]) body[k] = Number($(k).value);
+    await act("model/settings", body);
+    $("saved").textContent = "сохранено"; setTimeout(() => $("saved").textContent = "", 1500);
+  };
+  async function poll() {
+    try { render(await api("status")); }
+    catch (e) {
+      const denied = e.message.includes("токен");
+      $("headline").textContent = denied ? "нет доступа: нужен токен" : "сервер не отвечает";
+      $("login").hidden = !denied;
+    }
+    setTimeout(poll, status && (status.state === "starting" || (status.download || {}).state === "running") ? 700 : 2500);
+  }
+  // ---------- базы ----------
+  let basesData = null, showAll = false;
+  const esc = (t) => String(t ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  function renderBases(d) {
+    basesData = d;
+    const running = Object.values(d.jobs).some((j) => j.state === "running");
+    const list = d.bases.filter((b) => showAll || b.exists);
+    $("bases").innerHTML = list.map((b) => {
+      const job = d.jobs[b.id];
+      const last = b.last_export ? `последняя выгрузка ${esc(b.last_export.at)}: ${esc(b.last_export.result)}` : "исходники не выгружались";
+      const state = job ? { running: "⏳ выгружаю…", done: "✓ " + esc(job.result), error: '<span class="err">✕ ' + esc(job.result) + "</span>" }[job.state] : "";
+      return `<div class="base"><div class="row"><b class="grow">${esc(b.title)}</b>
+          ${b.published ? '<span class="muted">опубликована ibsrv</span>' : ""}
+          <button data-export="${b.id}" ${running || !b.exists ? "disabled" : ""}>Выгрузить исходники</button></div>
+        <div class="muted">${esc(b.path)}${b.user ? " · " + esc(b.user) : ""} · ${esc(b.source)}</div>
+        <div class="muted">${job ? state : last}</div>
+        ${job && job.log.length ? `<pre class="log">${esc(job.log.slice(-12).join("\n"))}</pre>` : ""}</div>`;
+    }).join("") + (d.bases.some((b) => !b.exists) ? `<div class="row"><a href="#" id="toggleAll" class="muted">${showAll ? "скрыть" : "показать"} недоступные базы</a></div>` : "");
+    document.querySelectorAll("[data-export]").forEach((btn) => btn.onclick = () => basesAct("bases/export", { base_id: btn.dataset.export }));
+    if ($("toggleAll")) $("toggleAll").onclick = (e) => { e.preventDefault(); showAll = !showAll; renderBases(basesData); };
+  }
+  async function basesAct(path, body) {
+    try { renderBases(await api(path, body)); $("basesError").textContent = ""; }
+    catch (e) { $("basesError").textContent = e.message; }
+  }
+  $("addBase").onclick = () => basesAct("bases/add", { path: $("newPath").value, user: $("newUser").value });
+  async function pollBases() {
+    try { renderBases(await api("bases")); } catch (e) { /* статус модели покажет ошибку */ }
+    const running = basesData && Object.values(basesData.jobs).some((j) => j.state === "running");
+    setTimeout(pollBases, running ? 1500 : 5000);
+  }
+  pollBases();
+
+  $("tokenSave").onclick = () => {
+    token = $("tokenInput").value.trim();
+    sessionStorage.setItem("onec-agent-token", token);
+    $("login").hidden = true;
+  };
+  poll();
+</script>
+</body>
+</html>

@@ -227,3 +227,91 @@ def test_distinguishing_word_resolves_counterparty(session):
     _sidorenko_dialog(session, "Реализация для Сидоренко Марии: одна услуга по обновлению прошивки ККТ за 1500")
     who = {"_ref": "Справочник.Контрагенты", "uuid": "11111111-0000-0000-0000-000000000002", "repr": "Сидоренко Мария Олеговна"}
     assert session._missing_data("sale_create", {**SALE, "counterparty": who}) == []
+
+
+def _found(*refs):
+    return {"role": "tool", "tool_call_id": "f", "content": json.dumps({"items": list(refs)}, ensure_ascii=False)}
+
+
+TWO_SIDORENKO = ({"_ref": "Справочник.Контрагенты", "uuid": "u1", "repr": "Сидоренко Павел Андреевич ИП «Лотос»"},
+             {"_ref": "Справочник.Контрагенты", "uuid": "u2", "repr": "Сидоренко Мария Олеговна"})
+INVOICES = ({"_ref": "Документ.СчетНаОплатуПокупателю", "uuid": "d1", "repr": "Счет на оплату 0000-000012 от 01.10.2026"},
+            {"_ref": "Документ.СчетНаОплатуПокупателю", "uuid": "d2", "repr": "Счет на оплату 0000-000015 от 20.10.2026"})
+
+
+def test_object_create_with_ambiguous_reference_is_blocked(session):
+    session.messages.append({"role": "user", "content": "Создай акт сверки с Сидоренко за октябрь"})
+    session.messages.append(_found(*TWO_SIDORENKO))
+    args = {"full_name": "Документ.АктСверкиВзаиморасчетов", "fields": {"Контрагент": TWO_SIDORENKO[0]}}
+    err = session._unconfirmed_numbers("object_create", args)
+    assert err.startswith("Не создаю:") and "Мария Олеговна" in err and "options" in err
+    session.messages[-2]["content"] = "Создай акт сверки с Сидоренко из Лотоса за октябрь"
+    assert session._unconfirmed_numbers("object_create", args) is None
+
+
+def test_object_update_of_ambiguous_document_is_blocked(session):
+    session.messages.append({"role": "user", "content": "Поменяй дату счёта Альфа-Инжиниринг на 25.10.2026"})
+    session.messages.append(_found(*INVOICES))
+    args = {"ref": {"_ref": "Документ.СчетНаОплатуПокупателю", "uuid": "d1"}, "fields": {"Дата": "2026-10-25"}}
+    err = session._unconfirmed_numbers("object_update", args)
+    assert err.startswith("Не меняю:") and "какой именно объект" in err and "000015" in err
+    session.messages[-2]["content"] = "Поменяй дату счёта 0000-000012 Альфа-Инжиниринг на 25.10.2026"
+    assert session._unconfirmed_numbers("object_update", args) is None
+
+
+def test_object_update_invented_number_is_blocked(session):
+    session.messages.append({"role": "user", "content": "Поставь в счёте 12 комментарий «срочно»"})
+    args = {"ref": {"_ref": "Документ.СчетНаОплатуПокупателю", "uuid": "d1"},
+            "fields": {"Комментарий": "срочно", "СуммаДокумента": 15000}}
+    assert "СуммаДокумента = 15000" in session._unconfirmed_numbers("object_update", args)
+
+
+SALES = tuple({"_ref": "Документ.РеализацияТоваровУслуг", "uuid": f"s{i}", "repr": f"Реализация 0000-00000{i} от 0{i}.09.2026"}
+              for i in range(1, 4))
+
+
+def test_reading_found_documents_one_by_one_is_stopped(session):
+    session.messages.append({"role": "user", "content": "Поставь комментарий «проверить» в реализацию для Альфа-Инжиниринг"})
+    session.messages.append(_found(*SALES))
+    session.turn_reads = 3
+    assert session._reading_loop("object_get") is None
+    session.turn_reads = 4
+    stop = session._reading_loop("object_get")
+    assert stop.startswith("Хватит") and "0000-000002" in stop and "ask_user" in stop
+    assert session._reading_loop("object_find") is None
+
+
+def test_object_find_hints_to_ask_when_action_needs_one_document(session):
+    session.messages.append({"role": "user", "content": "Поставь комментарий «проверить» в реализацию для Альфа-Инжиниринг"})
+    found = json.dumps({"items": [{**r, "date": f"2026-09-0{i}"} for i, r in enumerate(SALES, 1)]}, ensure_ascii=False)
+    assert "ask_user" in json.loads(session._date_hint(found))["hint"]
+    session.messages[-1]["content"] = "Покажи реализации Альфа-Инжиниринг"
+    assert "hint" not in json.loads(session._date_hint(found))
+
+
+def test_long_action_waits_by_its_own_timeout(session, monkeypatch):
+    from onec_agent import config
+    monkeypatch.setattr(config, "LONG_TOOL_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(config, "TOOL_TIMEOUT_SEC", 100)
+    event = {"type": "tool_call", "id": "c1", "name": "month_close_run", "needs_approval": True, "long": True}
+    res = asyncio.run(session._run_client_tool("c1", event))
+    assert not res["ok"] and "ещё выполняется" in res["error"]
+
+
+def test_third_identical_call_is_stopped(session):
+    args = {"query": "проверка готовности к закрытию месяца"}
+    assert session._repeated_call("kb_search", args) is None
+    assert session._repeated_call("kb_search", args) is None
+    stop = session._repeated_call("kb_search", args)
+    assert stop.startswith("Хватит") and "ask_user" in stop
+    assert session._repeated_call("kb_search", {"query": "другое"}) is None
+    session.turn_calls = []  # новый ход — счётчик с нуля (start_turn обнуляет его)
+    assert session._repeated_call("kb_search", args) is None
+
+
+def test_second_identical_action_is_stopped(session):
+    args = {"period": "2026-10"}
+    assert session._repeated_call("month_close_run", args) is None
+    stop = session._repeated_call("month_close_run", args)
+    assert stop.startswith("Хватит") and "ошибки" in stop
+    assert session._repeated_call("month_close_run", {"period": "2026-11"}) is None

@@ -53,3 +53,15 @@ def test_titles_survive_wrong_argument_shapes(tool):
     props = tool.parameters.get("properties", {})
     for value in ("Ромашка", 5, None, [], {}):
         tool.title({k: value for k in props})
+
+
+def test_long_actions_are_marked():
+    from onec_agent.tools import BY_NAME
+    assert BY_NAME["month_close_run"].long and BY_NAME["month_close_run"].needs_approval
+    assert not BY_NAME["document_post"].long
+
+
+def test_closing_group_triggers_on_imperative():
+    from onec_agent.agent import TOOL_GROUP_TRIGGERS
+    for text in ("Закрой октябрь 2026", "Что мешает закрыть сентябрь?", "Закрытие месяца не прошло", "перепроведи документы"):
+        assert TOOL_GROUP_TRIGGERS["closing"].search(text), text

@@ -27,6 +27,7 @@ class Tool:
     executor: str = "client"
     needs_approval: bool = False
     kind: str = "read"  # read | action
+    long: bool = False  # длительное действие (минуты и дольше) — ждём его по config.LONG_TOOL_TIMEOUT_SEC
 
     def openai_schema(self) -> dict:
         return {
@@ -98,18 +99,25 @@ TOOLS: list[Tool] = [
         name="object_find",
         description=(
             "Найти объекты (документы, элементы справочников) по номеру, коду или наименованию. "
+            "Документы конкретного контрагента (организации, склада) ищи отбором filters — по тексту номера "
+            "их не найти: {\"full_name\": \"Документ.РеализацияТоваровУслуг\", \"text\": \"\", "
+            "\"filters\": {\"Контрагент\": \"Альфа-Инжиниринг\"}}. "
             "Возвращает ссылки, которые можно передать в object_get, document_movements, ui_open."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "full_name": {"type": "string", "description": "Например «Документ.РеализацияТоваровУслуг» или «Справочник.Контрагенты»"},
-                "text": {"type": "string", "description": "Номер, код или часть наименования"},
+                "text": {"type": "string", "description": "Номер, код или часть наименования; пустая строка — любые (с filters)"},
+                "filters": {"type": "object", "description": "Отбор по реквизитам шапки: {Реквизит: ссылка или наименование}, "
+                                                             "например {\"Контрагент\": \"Альфа-Инжиниринг\"}"},
                 "limit": {"type": "integer", "description": "Сколько вернуть, по умолчанию 20"},
             },
             "required": ["full_name", "text"],
         },
-        title=lambda a: f"Ищу {a.get('full_name', '')}: «{a.get('text', '')}»",
+        title=lambda a: f"Ищу {a.get('full_name', '')}: «{a.get('text', '')}»"
+                        + (" с отбором " + ", ".join(f"{k} = {shown(v)}" for k, v in a["filters"].items())
+                           if isinstance(a.get("filters"), dict) and a["filters"] else ""),
     ),
     Tool(
         name="object_get",
@@ -619,7 +627,9 @@ TOOLS += [
             "Прочитать исходный код модуля конфигурации (по выгрузке в файлы). module — имя как в тексте ошибки 1С: "
             "«Документ.РеализацияТоваровУслуг.МодульОбъекта», «ОбщийМодуль.ОбщегоНазначения», "
             "«Документ.X.Форма.ФормаДокумента.Форма»; можно передать прямо фрагмент ошибки «{…МодульОбъекта(512)}». "
-            "С line — код вокруг строки и процедура, в которой она; с procedure — текст процедуры; без них — список процедур."
+            "С line — код вокруг строки и процедура, в которой она; с procedure — текст процедуры; без них — список процедур. "
+            "По умолчанию — код основной конфигурации; source — имя расширения (из extensions_list), чтобы прочитать "
+            "его код. Если модуль доработан расширением, в ответе also_in: что расширение перехватывает (&Вместо…)."
         ),
         parameters={
             "type": "object",
@@ -628,31 +638,36 @@ TOOLS += [
                 "line": {"type": "integer", "description": "Номер строки из текста ошибки"},
                 "procedure": {"type": "string", "description": "Имя процедуры или функции"},
                 "start": {"type": "integer", "description": "С какой строки продолжить длинную процедуру"},
+                "source": {"type": "string", "description": "Имя расширения или «Конфигурация»"},
             },
             "required": ["module"],
         },
         title=lambda a: f"Читаю код {a.get('module', '')}" + (f", строка {a['line']}" if a.get("line") else "")
-                        + (f", {a['procedure']}" if a.get("procedure") else ""),
-        executor="server",
+                        + (f", {a['procedure']}" if a.get("procedure") else "")
+                        + (f" [{a['source']}]" if a.get("source") else ""),
+        executor="client",
     ),
     Tool(
         name="code_search",
         description=(
             "Найти в коде конфигурации и расширений место по тексту: имя процедуры, реквизита, регистра, фрагмент "
             "сообщения об ошибке («Не заполнено поле…»). scope сужает поиск: «Документ.РеализацияТоваровУслуг», "
-            "«ОбщийМодуль». Возвращает модуль(строка): текст строки."
+            "«ОбщийМодуль». source — только в коде этого расширения (имя из extensions_list): для вопросов «что "
+            "меняет расширение». Возвращает модуль(строка): текст строки; строки расширений помечены [имя]."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "Искомый текст, от 3 символов"},
                 "scope": {"type": "string", "description": "Необязательно: вид объекта или объект"},
+                "source": {"type": "string", "description": "Необязательно: имя расширения или «Конфигурация»"},
                 "limit": {"type": "integer"},
             },
             "required": ["text"],
         },
-        title=lambda a: f"Ищу в коде: «{a.get('text', '')}»" + (f" в {a['scope']}" if a.get("scope") else ""),
-        executor="server",
+        title=lambda a: f"Ищу в коде: «{a.get('text', '')}»" + (f" в {a['scope']}" if a.get("scope") else "")
+                        + (f" [{a['source']}]" if a.get("source") else ""),
+        executor="client",
     ),
     Tool(
         name="kb_search",
@@ -670,14 +685,75 @@ TOOLS += [
             "required": ["query"],
         },
         title=lambda a: f"Ищу в базе знаний: «{a.get('query', '')}»",
-        executor="server",
+        executor="client",
+    ),
+]
+
+
+# Группы инструментов: модели отдаём только нужные вопросу. Все 28 описаний — около четверти
+# контекста локальной модели; лишние замедляют первый ответ и сбивают выбор.
+TOOLS += [
+    Tool(
+        name="month_close_status",
+        description=(
+            "Состояние закрытия месяца по организации: регламентные операции с состояниями (Выполнено / Не выполнено / "
+            "Выполнено с ошибками / Пропущено, outdated — устарела), тексты ошибок операций, число документов к "
+            "перепроведению, закрыт ли месяц. period — «2026-09». Вызывай после month_close_run, чтобы показать итог."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "period": {"type": "string", "description": "Месяц: «2026-09»"},
+                "organization": {"type": "string", "description": "Наименование организации; если в базе одна — не нужно"},
+            },
+            "required": ["period"],
+        },
+        title=lambda a: f"Состояние закрытия месяца: {shown(a.get('period'))}",
+    ),
+    Tool(
+        name="month_close_check",
+        description=(
+            "Что мешает закрыть месяц: непроведённые документы периода, отрицательные остатки запасов и денег, "
+            "деньги в пути (57), НДС не к вычету (19), документы к перепроведению, регламентные операции с ошибками "
+            "и устаревшие. Вызывай на «можно ли закрыть», «что мешает», «проверь перед закрытием» и всегда перед month_close_run."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "period": {"type": "string", "description": "Месяц: «2026-09»"},
+                "organization": {"type": "string", "description": "Наименование организации; если в базе одна — не нужно"},
+            },
+            "required": ["period"],
+        },
+        title=lambda a: f"Проверяю готовность к закрытию: {shown(a.get('period'))}",
+    ),
+    Tool(
+        name="month_close_run",
+        description=(
+            "Выполнить закрытие месяца: перепроведение документов (если требуется) и все регламентные операции по порядку — "
+            "как кнопка «Выполнить закрытие месяца». Пользователь подтвердит в окне 1С. Только по явной просьбе закрыть "
+            "месяц и после month_close_check. Возвращает выполненные операции и итоговое состояние с ошибками. "
+            "until — kind операции из month_close_status, до которой выполнять включительно."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "period": {"type": "string", "description": "Месяц: «2026-09»"},
+                "organization": {"type": "string", "description": "Наименование организации; если в базе одна — не нужно"},
+                "until": {"type": "string", "description": "Имя вида операции (kind), до которой выполнять; пусто — все"},
+            },
+            "required": ["period"],
+        },
+        title=lambda a: f"Закрыть месяц {shown(a.get('period'))}" + (f" ({shown(a['organization'])})" if a.get("organization") else "")
+                        + (f" до операции {shown(a['until'])}" if a.get("until") else ""),
+        needs_approval=True,
+        kind="action",
+        long=True,
     ),
 ]
 
 BY_NAME = {t.name: t for t in TOOLS}
 
-# Группы инструментов: модели отдаём только нужные вопросу. Все 28 описаний — около четверти
-# контекста локальной модели; лишние замедляют первый ответ и сбивают выбор.
 GROUPS = {
     "core": ["metadata_search", "metadata_describe", "object_find", "object_get", "query_run", "kb_search", "ask_user"],
     "data": ["register_balance", "register_turnover", "account_report", "report_run", "document_movements"],
@@ -687,6 +763,7 @@ GROUPS = {
                 "object_update", "document_post", "document_unpost", "open_list", "ui_open"],
     "files": ["file_read", "file_search"],
     "reporting": ["regulated_report", "vat_book", "vat_reconcile", "account_report"],
+    "closing": ["month_close_status", "month_close_check", "month_close_run", "posting_check", "account_report"],
 }
 
 

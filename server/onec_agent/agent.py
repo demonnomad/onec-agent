@@ -14,7 +14,7 @@ from typing import Awaitable, Callable
 
 import aiohttp
 
-from . import audit, config, files, kb, providers, settings, sources
+from . import audit, config, files, providers, settings
 from .tools import BY_NAME, openai_tools
 
 log = logging.getLogger("onec_agent.agent")
@@ -98,15 +98,24 @@ SYSTEM_PROMPT = """Ты — ИИ-консультант, встроенный в
   ни «похожую» номенклатуру из базы): вызови ask_user и спроси одним вопросом всё недостающее; найденные
   в базе варианты (контрагенты, номенклатура) дай в options. Несколько подходящих контрагентов или позиций —
   тоже ask_user с вариантами. Только когда всё названо — вызывай инструмент создания.
+  Перед вызовом создания проверь себя: назван ли контрагент (и один ли он среди найденных), позиции,
+  количество, цена. Чего-то нет — сначала ask_user; вызов «на пробу» без данных будет отклонён.
+  Выбор из найденных вариантов всегда предлагай кнопками (ask_user с options), а не перечислением в тексте.
   Количество словами («одна», «две», «пара») — это число, не переспрашивай.
   НЕ спрашивай то, что заполнит 1С: ставку и сумму НДС, счета учёта, организацию, склад, договор
   (если у контрагента он один) — для документа достаточно контрагента, позиций, количества и цены.
 - Перед созданием прочего объекта: metadata_describe, обязательные реквизиты — тем, что назвал пользователь.
 - Если 1С вернула «несколько подходящих» или «не найдено» — покажи варианты пользователю и уточни.
+  Под описание подходит несколько документов («реализация для Альфы», а их шесть) — не читай их по одному
+  и не выбирай сам: ask_user с вариантами (номер и дата каждого).
 - После создания сообщи, что создано и что пользователь выбрал (outcome), и что осталось незаполненным.
 - Пользователь может прикрепить файлы (скриншоты, Excel, PDF, Word, текст). В сообщении видно начало файла;
   остальное читай file_read по частям, конкретные строки ищи file_search. Сверяя файл с базой, бери
   значения из файла (номера, ИНН, суммы) и проверяй их запросами к базе. Скриншот уже переведён в текст.
+- Закрытие месяца. На «можно ли закрыть», «что мешает», «проверь» — month_close_check (и month_close_status, если
+  спрашивают про операции): перечисли проблемы с документами и что с ними сделать. Само закрытие — month_close_run,
+  только по явной просьбе «закрой месяц» и после проверки; после него — какие операции выполнены, какие с ошибками
+  и что исправить. Операция с ошибками — не повторяй закрытие, сначала исправление по тексту ошибки.
 - Если вопрос неоднозначен — задай один короткий уточняющий вопрос.
 - Номер вида «ДС00-000003», «0000-000045» — номер документа: ищи object_find по нужному документу, не среди контрагентов.
 - Удалять и помечать на удаление объекты ты не можешь — так и скажи; пользователь делает это сам
@@ -118,7 +127,7 @@ SYSTEM_PROMPT = """Ты — ИИ-консультант, встроенный в
 {notes}"""
 
 GOODS_TOOLS = {"invoice_create", "sale_create", "purchase_create"}
-DATA_GUARD_TOOLS = GOODS_TOOLS | {"object_create"}
+DATA_GUARD_TOOLS = GOODS_TOOLS | {"object_create", "object_update"}
 # Слова, по которым нельзя считать, что пользователь назвал объект: «ООО», «ИП», «услуга»…
 GENERIC_STEMS = {"ооо", "оао", "зао", "пао", "ао", "ип", "услуг", "товар", "работ", "по", "на", "для", "из",
                  "от", "и", "в", "с", "шт"}
@@ -136,16 +145,16 @@ def _stems(text: str, size: int = 5) -> set[str]:
 _REF_OBJECT = re.compile(r'\{[^{}]*"_ref"[^{}]*\}')
 
 
-def _refs_in(text: str, full_name: str) -> list[dict]:
-    """Ссылки {"_ref", "uuid", "repr"} нужного вида из результата инструмента (без разбора всего JSON:
-    результат бывает обрезан)."""
+def _refs_in(text: str, full_name: str | None = None) -> list[dict]:
+    """Ссылки {"_ref", "uuid", "repr"} из результата инструмента (без разбора всего JSON: результат бывает
+    обрезан); full_name — только этого вида, иначе все."""
     found = []
     for raw in _REF_OBJECT.findall(text or ""):
         try:
             ref = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if ref.get("_ref") == full_name and ref.get("uuid") and ref not in found:
+        if (full_name is None or ref.get("_ref") == full_name) and ref.get("_ref") and ref.get("uuid") and ref not in found:
             found.append(ref)
     return found
 
@@ -154,6 +163,9 @@ def _label(value) -> str:
     return value.get("repr", "?") if isinstance(value, dict) else str(value or "?")
 _NUM = re.compile(r"(?<![\w.])\d+(?:[ \u00a0]\d{3})*(?:[.,]\d+)?")
 _DATE = re.compile(r"\b(\d{2})\.(\d{2})\.(\d{4})\b")
+# Глаголы действия над одним документом: «поставь комментарий в реализацию», «проведи счёт».
+_ACTION_VERB = re.compile(r"\b(постав|измен|помен|провед|отмен|запиш|исправ|удал|перепров|распров|сделай на основании|введи на основании)",
+                          re.IGNORECASE)
 
 
 # Количество словами: «одна услуга», «две штуки», «пара».
@@ -192,6 +204,8 @@ TOOL_GROUP_TRIGGERS = {
     "reporting": re.compile(r"деклараци|отч[её]тност|регламент|книг[аиуе] (продаж|покупок)|сверк|ндс|баланс|"
                             r"финансов\w* результат|6-?ндфл|рсв|страхов\w* взнос|усн|к уплате|к возмещению|"
                             r"строк[аеиу] \d{3}|раздел[а-я]* \d", re.IGNORECASE),
+    "closing": re.compile(r"закры|закро[йе]|регламентн\w* операц|амортизац|реформац|перепровед|себестоимост|"
+                          r"финансов\w* результат", re.IGNORECASE),
     "actions": re.compile(r"созда|выстав|оформ|сдела|проведи|провести|перепровед|отмени|измени|помен|исправь|замени|"
                           r"открой|покажи список|на основании|запиши|добав|завед|пометь|выпиши", re.IGNORECASE),
 }
@@ -296,13 +310,6 @@ def _safe_title(tool, args: dict) -> str:
         return tool.name
 
 
-def _int(value) -> int | None:
-    try:
-        return int(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
-
-
 def _money(x: float) -> str:
     return f"{x:,.2f}".replace(",", " ").replace(".", ",")
 
@@ -377,6 +384,10 @@ class AgentSession:
         self.client = providers.Client(self.profile)
         self.stop_requested = False
         self.dry_run_tools: set[str] = set()  # в тестовом прогоне эти инструменты не выполняются
+        self.guarded_ids: set[str] = set()  # вызовы действий, которые перехватила защита (в 1С не ушли)
+        self.asked: list[dict] = []  # уточняющие вопросы (вопрос + варианты) — в журнал и в протокол тестов
+        self.turn_reads = 0  # чтений объектов за ход: перебор найденных документов по одному останавливаем
+        self.turn_calls: list[str] = []  # вызовы хода «имя+аргументы»: одинаковые подряд — зацикливание
         self.session_id = ""  # идентификатор диалога со стороны страницы — к нему привязаны вложения
 
     def set_context(self, ctx: dict) -> None:
@@ -391,6 +402,14 @@ class AgentSession:
     def apply_profile(self, profile: dict) -> None:
         self.profile = profile
         self.client = providers.Client(profile)
+
+    async def refresh_profile(self) -> None:
+        """Профиль базы могли сменить из другого чата или приложения, пока этот открыт — перед ходом
+        берём сохранённый и обновляем шапку чата."""
+        saved = settings.profile_for(self.base_id)
+        if saved != self.profile:
+            self.apply_profile(saved)
+            await self.emit({"type": "model", **settings.public(saved), "can_edit": bool(self.context.get("is_admin"))})
 
     def reset(self) -> None:
         prompt = SYSTEM_PROMPT.format(context=_format_context(self.context), notes=_base_notes(self.context))
@@ -416,6 +435,8 @@ class AgentSession:
 
     def start_turn(self, text: str, attachments: list[str] | None = None) -> None:
         self.kb_query = text
+        self.turn_reads = 0
+        self.turn_calls = []
         self.tool_groups = self._pick_groups(text, attachments)
         if attachments and self.session_id:
             text += files.attachment_note(self.session_id, attachments)
@@ -443,18 +464,19 @@ class AgentSession:
         # сумму») похожие по словам обращения подмешивают шум и уводят модель не туда.
         if not query or query.startswith("/") or not KB_AUTO_TRIGGER.search(query):
             return
-        found = await asyncio.to_thread(kb.search, query, None, 3)
-        results = found.get("results") or []
+        # База знаний живёт в расширении (макет иик_БазаЗнаний) — ищет 1С, шаг видит пользователь.
+        call_id = f"auto-kb-{len(self.messages)}"
+        event = {"type": "tool_call", "id": call_id, "name": "kb_search", "args": {"query": query[:200], "limit": 3},
+                 "title": "Ищу в базе знаний похожее", "kind": "read", "needs_approval": False, "executor": "client"}
+        found = await self._run_client_tool(call_id, event)
+        try:
+            results = json.loads(found.get("result") or "{}").get("results") or [] if found.get("ok") else []
+        except json.JSONDecodeError:
+            results = []
         if not results or results[0]["score"] < KB_AUTO_MIN_SCORE:
             return
         top = results[0]["score"]
         picked = [r for r in results if r["score"] >= max(KB_AUTO_MIN_SCORE, 0.6 * top)][:2]
-        call_id = f"auto-kb-{len(self.messages)}"
-        summary = "; ".join(r["title"] for r in picked)
-        await self.emit({"type": "tool_call", "id": call_id, "name": "kb_search", "args": {"query": query[:200]},
-                         "title": "Ищу в базе знаний похожее", "kind": "read", "needs_approval": False, "executor": "server"})
-        await self.emit({"type": "tool_result", "id": call_id, "ok": True, "summary": summary,
-                         "result": json.dumps({"results": picked}, ensure_ascii=False)})
         note = "\n\n".join(f"[{r['kind']}: {r['source']}]\n{r['text']}" for r in picked)
         self.messages[-1]["content"] += (
             "\n\n---\nИз базы знаний компании (найдено автоматически по вопросу; опирайся на это, если относится "
@@ -462,6 +484,7 @@ class AgentSession:
 
     async def _run_turn(self) -> None:
         try:
+            await self.refresh_profile()
             await self._auto_kb()
             for _ in range(config.MAX_AGENT_STEPS):
                 final = None
@@ -499,6 +522,9 @@ class AgentSession:
                     # и ждём сообщения пользователя.
                     text = str(question.get("question") or "Уточните, пожалуйста.").strip()
                     options = self._grounded_options(question.get("options"))
+                    audit.record(self.context, "ask_user", {"question": text, "options": options},
+                                 {"ok": True, "summary": text[:120]})
+                    self.asked.append({"question": text, "options": options})
                     self.messages.append({"role": "assistant", "content": text + (
                         "\nВарианты: " + "; ".join(options) if options else "")})
                     await self.emit({"type": "text_delta", "text": text})
@@ -561,15 +587,23 @@ class AgentSession:
             "kind": tool.kind,
             "needs_approval": tool.needs_approval,
             "executor": tool.executor,
+            "long": tool.long,
         }
-        guard = self._unconfirmed_numbers(name, args)
+        if name == "object_get":
+            self.turn_reads += 1
+        guard = self._unconfirmed_numbers(name, args) or self._reading_loop(name) or self._repeated_call(name, args)
         if guard:
+            self.guarded_ids.add(call["id"])
             # Данных от пользователя не хватает — в 1С не идём. В чате это не «неудачное действие»,
             # а проверка: видно, что агент сверил данные и сейчас уточнит недостающее.
+            if name in DATA_GUARD_TOOLS:
+                title, summary = "Проверяю, хватает ли данных для документа", "нужно уточнить: " + "; ".join(self._missing_data(name, args))
+            else:
+                title, summary = ("Повтор того же вызова — останавливаю" if guard.startswith("Хватит: ") else
+                                  "Нашлось несколько документов — нужно спросить пользователя"), guard
             await self.emit({**event, "executor": "server", "needs_approval": False, "dry_run": True,
-                             "kind": "read", "title": "Проверяю, хватает ли данных для документа"})
-            await self.emit({"type": "tool_result", "id": call["id"], "ok": True,
-                             "summary": "нужно уточнить: " + "; ".join(self._missing_data(name, args))[:200]})
+                             "kind": "read", "title": title})
+            await self.emit({"type": "tool_result", "id": call["id"], "ok": True, "summary": summary[:200]})
             payload = {"ok": False, "error": guard}
         elif name in self.dry_run_tools:
             # Тестовый прогон: показываем попытку, но в 1С ничего не делаем — как будто пользователь отказал.
@@ -579,7 +613,7 @@ class AgentSession:
             await self.emit({"type": "tool_result", "id": call["id"], **payload})
         elif tool.executor == "server":
             await self.emit(event)
-            payload = await asyncio.to_thread(self._run_server_tool, name, args)  # поиск по коду — секунды
+            payload = await asyncio.to_thread(self._run_server_tool, name, args)  # разбор вложений — секунды
             await self.emit({"type": "tool_result", "id": call["id"], **payload})
         else:
             payload = await self._run_client_tool(call["id"], event)
@@ -594,13 +628,54 @@ class AgentSession:
         items = [i for i in data.get("items") or [] if isinstance(i, dict) and i.get("date")]
         user = next((m["content"] for m in reversed(self.messages) if m.get("role") == "user"), "")
         dates = {f"{y}-{mo}-{d}" for d, mo, y in _DATE.findall(user if isinstance(user, str) else "")}
-        if len(items) < 2 or not dates:
+        if len(items) < 2:
             return text
         match = [i for i in items if str(i["date"])[:10] in dates]
         if len(match) == 1:
             data["hint"] = (f"Пользователь назвал дату — подходит один документ: {match[0].get('repr')}. "
                             "Бери его, не переспрашивай.")
+        elif _ACTION_VERB.search(user if isinstance(user, str) else ""):
+            data["hint"] = (f"Найдено {len(items)} документов, а действие нужно с одним. Не читай их по одному и не "
+                            "выбирай сам: вызови ask_user с вариантами (представление каждого) — пользователь выберет.")
         return json.dumps(data, ensure_ascii=False)
+
+    def _repeated_call(self, name: str, args: dict) -> str | None:
+        """Тот же инструмент с теми же аргументами в третий раз за ход — модель зациклилась (GigaChat так
+        повторяет kb_search, не найдя «инструмент» в статье). Результат уже есть — пусть действует по нему."""
+        key = name + ":" + json.dumps(args, ensure_ascii=False, sort_keys=True)
+        repeats = self.turn_calls.count(key)
+        self.turn_calls.append(key)
+        tool = BY_NAME.get(name)
+        if name == "ask_user" or tool is None:
+            return None
+        if tool.kind == "action":
+            # Действие с теми же аргументами второй раз за ход: закрытие месяца «с ошибками» → модель тут же
+            # запускает его снова, а пользователь получает второй диалог. Сначала объяснение и исправление.
+            if repeats < 1:
+                return None
+            return (f"Хватит: {name} с теми же аргументами уже выполнялся в этом ходе — повтор даст тот же результат. "
+                    "Расскажи пользователю, что вышло (в том числе ошибки и что исправить), и жди его решения.")
+        if repeats < 2:
+            return None
+        return (f"Хватит: {name} с теми же аргументами уже вызывался {repeats} раза, результат не изменится. "
+                "Используй уже полученный результат, возьми другой инструмент или спроси пользователя (ask_user).")
+
+    def _reading_loop(self, name: str) -> str | None:
+        """Модель перебирает найденные документы object_get по одному, чтобы выбрать «нужный» сама
+        (GigaChat так уходит в лимит шагов). После трёх чтений за ход — стоп: пусть спросит пользователя."""
+        if name != "object_get" or self.turn_reads <= 3:
+            return None
+        for m in reversed(self.messages):
+            if m.get("role") != "tool":
+                continue
+            refs = _refs_in(m.get("content") if isinstance(m.get("content"), str) else "")
+            kinds = {r["_ref"] for r in refs}
+            same = [r for r in refs if r["_ref"] == max(kinds, key=lambda k: sum(x["_ref"] == k for x in refs))] if kinds else []
+            if len(same) >= 2:
+                names = [str(r.get("repr", "?")) for r in same][:6]
+                return (f"Хватит читать документы по одному: под описание подходят {len(same)} — «" + "», «".join(names)
+                        + "». Вызови ask_user и дай их в options — пользователь выберет сам.")
+        return None
 
     def _grounded_options(self, options) -> list[str]:
         """Варианты-кнопки к вопросу — только из найденного в базе или из слов пользователя. Модель любит
@@ -674,7 +749,7 @@ class AgentSession:
                         missing.append(f"{title} для «{_label(item.get('item'))}»")
                     elif not any(abs(value - k) < 0.005 for k in numbers):
                         missing.append(f"{title} {value:g} — пользователь её не называл")
-        else:  # object_create: имя элемента и числа из полей
+        else:  # object_create / object_update: имя элемента, числа и ссылки из полей
             fields = args.get("fields") if isinstance(args.get("fields"), dict) else {}
             for key in ("Наименование", "НаименованиеПолное"):
                 if fields.get(key) and not named(fields[key]):
@@ -683,36 +758,74 @@ class AgentSession:
                 if isinstance(value, (int, float)) and not isinstance(value, bool) \
                         and not any(abs(value - k) < 0.005 for k in numbers):
                     missing.append(f"{key} = {value:g} — пользователь этого не называл")
+                elif isinstance(value, (str, dict)):
+                    rivals = self._ambiguous_ref(value, said)
+                    if rivals:
+                        missing.append(f"{key}: под названное подходят {len(rivals) + 1} — «{_label(value)}», «"
+                                       + "», «".join(rivals) + "»; спроси, дав их в options")
+            if name == "object_update":
+                # Модель нашла несколько документов и правит первый попавшийся — пользователь выбирает сам.
+                rivals = self._ambiguous_ref(args.get("ref"), said)
+                if rivals:
+                    missing.append(f"какой именно объект менять: под названное подходят {len(rivals) + 1} — "
+                                   f"«{self._known_repr(args.get('ref'))}», «" + "», «".join(rivals) + "»; спроси, дав их в options")
         return missing
 
     def _ambiguous_counterparty(self, who, said: str) -> list[str]:
-        """Если поиск в этом диалоге нашёл несколько контрагентов, среди которых выбранный, а пользователь
-        не назвал ничего, что отличает выбранного от остальных (имя, название, ИНН), — остальные кандидаты.
-        Модель иначе выбирает «первого Сидоренко» сама."""
-        chosen_uuid = who.get("uuid") if isinstance(who, dict) else None
-        chosen_repr = _label(who).strip().lower()
+        return self._ambiguous_ref(who, said, "Справочник.Контрагенты")
+
+    def _ambiguous_ref(self, value, said: str, kind: str | None = None) -> list[str]:
+        """Если поиск в этом диалоге нашёл несколько объектов одного вида, среди которых выбранный, а пользователь
+        не назвал ничего, что отличает выбранный от остальных (имя, название, номер, ИНН), — остальные кандидаты.
+        Модель иначе выбирает «первого Сидоренко» (или первый из найденных счетов) сама. value — ссылка
+        {"_ref", "uuid", "repr"} или наименование строкой; kind — вид объекта, иначе берётся из ссылки."""
+        chosen_uuid = value.get("uuid") if isinstance(value, dict) else None
+        chosen_repr = _label(value).strip().lower()
+        if not chosen_uuid and chosen_repr in ("", "?"):
+            return []
+        kind = kind or (value.get("_ref") if isinstance(value, dict) else None)
         said_stems, said_low = _stems(said, 4), said.lower()
         for m in reversed(self.messages):
             if m.get("role") != "tool":
                 continue
-            refs = _refs_in(m.get("content") if isinstance(m.get("content"), str) else "", "Справочник.Контрагенты")
-            chosen = [r for r in refs if r["uuid"] == chosen_uuid or str(r.get("repr", "")).strip().lower() == chosen_repr]
-            if len(refs) < 2 or not chosen:
-                continue
-            others = [r for r in refs if r is not chosen[0]]
-            other_stems = set().union(*(_stems(r.get("repr", ""), 4) for r in others))
-            own = _stems(chosen[0].get("repr", ""), 4) - other_stems - {g[:4] for g in GENERIC_STEMS}
-            if own & said_stems or (chosen[0].get("inn") and str(chosen[0]["inn"]) in said_low):
-                return []
-            return [str(r.get("repr", "?")) for r in others][:5]
+            found = _refs_in(m.get("content") if isinstance(m.get("content"), str) else "", kind)
+            by_kind: dict[str, list[dict]] = {}
+            for r in found:
+                by_kind.setdefault(r["_ref"], []).append(r)
+            for refs in by_kind.values():
+                chosen = [r for r in refs if r["uuid"] == chosen_uuid or str(r.get("repr", "")).strip().lower() == chosen_repr]
+                if len(refs) < 2 or not chosen:
+                    continue
+                others = [r for r in refs if r is not chosen[0]]
+                other_stems = set().union(*(_stems(r.get("repr", ""), 4) for r in others))
+                own = _stems(chosen[0].get("repr", ""), 4) - other_stems - {g[:4] for g in GENERIC_STEMS}
+                # Документы различаются номером («0000-000012» и «0000-000015» по основам слов не отличить).
+                own_numbers = _numbers(chosen[0].get("repr", "")) - set().union(*(_numbers(r.get("repr", "")) for r in others))
+                if own & said_stems or own_numbers & _numbers(said) \
+                        or (chosen[0].get("inn") and str(chosen[0]["inn"]) in said_low):
+                    return []
+                return [str(r.get("repr", "?")) for r in others][:5]
         return []
+
+    def _known_repr(self, value) -> str:
+        """Представление ссылки, как его вернул инструмент в этом диалоге (у ссылки из аргументов его может не быть)."""
+        if not isinstance(value, dict) or value.get("repr") or not value.get("uuid"):
+            return _label(value)
+        for m in reversed(self.messages):
+            if m.get("role") != "tool":
+                continue
+            for r in _refs_in(m.get("content") if isinstance(m.get("content"), str) else ""):
+                if r["uuid"] == value["uuid"]:
+                    return str(r.get("repr", "?"))
+        return "?"
 
     def _unconfirmed_numbers(self, name: str, args: dict) -> str | None:
         """Текст отказа для модели, если данных документа не хватает (имя оставлено для совместимости)."""
         missing = self._missing_data(name, args)
         if not missing:
             return None
-        return ("Не создаю: не хватает данных от пользователя — " + "; ".join(missing) + ". Ничего не подставляй "
+        verb = "Не меняю" if name == "object_update" else "Не создаю"
+        return (f"{verb}: не хватает данных от пользователя — " + "; ".join(missing) + ". Ничего не подставляй "
                 "сам: вызови ask_user и спроси именно это (найденные в базе варианты можно дать в options).")
 
     def _run_server_tool(self, name: str, args: dict) -> dict:
@@ -724,32 +837,28 @@ class AgentSession:
             elif name == "file_search":
                 result = files.search(self.session_id, args.get("query", ""), args.get("file_id") or None)
                 summary = f"найдено строк: {result['total']}"
-            elif name == "code_read":
-                result = sources.read(self.context.get("config_name", ""), args.get("module", ""),
-                                      _int(args.get("line")), args.get("procedure") or None, _int(args.get("start")))
-                summary = f"{result['module']} [{result['source']}]"
-            elif name == "code_search":
-                result = sources.search(self.context.get("config_name", ""), args.get("text", ""),
-                                        args.get("scope") or None, _int(args.get("limit")) or 40)
-                summary = f"совпадений: {result['total']} в {result['modules']} модулях"
-            elif name == "kb_search":
-                result = kb.search(args.get("query", ""), args.get("kind"))
-                summary = f"найдено: {result['total']}"
             else:
                 raise files.FileError(f"нет серверного инструмента {name}")
             return {"ok": True, "result": json.dumps(result, ensure_ascii=False), "summary": summary}
-        except (files.FileError, sources.SourceError, ValueError) as exc:
+        except (files.FileError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     async def _run_client_tool(self, call_id: str, event: dict) -> dict:
         fut = asyncio.get_running_loop().create_future()
         self.pending[call_id] = fut
         await self.emit(event)
-        # Действие ждёт решения пользователя в окне 1С — долго; чтение отвечает за секунды — минута.
-        timeout = config.TOOL_TIMEOUT_SEC if event.get("needs_approval") else config.READ_TOOL_TIMEOUT_SEC
+        # Действие ждёт решения пользователя в окне 1С — долго; чтение отвечает за секунды — минута;
+        # длительное действие (закрытие месяца) — по отдельному лимиту.
+        if event.get("long"):
+            timeout = config.LONG_TOOL_TIMEOUT_SEC
+        else:
+            timeout = config.TOOL_TIMEOUT_SEC if event.get("needs_approval") else config.READ_TOOL_TIMEOUT_SEC
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
+            if event.get("long"):
+                return {"ok": False, "error": f"Действие не завершилось за {timeout // 60} мин — возможно, оно ещё "
+                                              "выполняется в 1С. Проверь состояние (month_close_status), не запускай повторно."}
             if event.get("needs_approval"):
                 return {"ok": False, "error": "Пользователь не ответил в окне 1С за отведённое время — действие не выполнено"}
             return {"ok": False, "error": f"1С не ответила за {timeout} с. Похоже, вкладка с базой зависла или "
@@ -769,7 +878,7 @@ class AgentSession:
         else:
             error = payload.get("error") or "ошибка без описания"
             # Отказ пользователя в окне 1С и отказ защиты от выдуманных чисел — не сбой обращения к базе.
-            if not error.startswith(("Пользователь отклонил", "Не создаю:")):
+            if not error.startswith(("Пользователь отклонил", "Не создаю:", "Не меняю:", "Хватит")):
                 self.errors_in_row += 1
                 self.last_error = error.replace("\n", " ")[:300]
             hint = next((h for marker, h in QUERY_ERROR_HINTS if marker in error), None)

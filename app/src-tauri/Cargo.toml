@@ -1,0 +1,14 @@
+[package]
+name = "onec-agent"
+version = "0.1.0"
+description = "onec-agent: сервер ИИ-консультанта 1С и встроенная модель — приложение в трее"
+edition = "2021"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"

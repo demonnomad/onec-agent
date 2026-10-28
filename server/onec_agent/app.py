@@ -5,6 +5,7 @@ GET  /ui.js, /ui.css — веб-интерфейс чата (подключае�
 GET  /dev      — тот же чат в обычном браузере, без моста 1С (для разработки)
 POST /upload   — вложение в диалог (multipart: поле session, затем file); заголовок X-Agent-Token
 WS   /ws       — протокол событий; первым сообщением — hello с токеном (auth.py)
+GET  /panel    — панель приложения (трей): встроенная модель, выгрузка базы; API /panel/api/* с X-Agent-Token
 """
 import asyncio
 import json
@@ -14,12 +15,14 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web
 
-from . import auth, config, evals, files, providers, settings
+from . import auth, bases, config, evals, files, local_model, providers, settings
 from .agent import AgentSession
 
 log = logging.getLogger("onec_agent")
-WEB = Path(__file__).parent / "web"
+WEB = Path(config.WEB_DIR)
 HTTP = web.AppKey("http", aiohttp.ClientSession)  # общий HTTP-клиент: модель, распознавание скриншотов
+IDLE = web.AppKey("idle", asyncio.Task)  # выгрузка встроенной модели при простое
+SOCKETS = web.AppKey("sockets", set)  # открытые чаты — закрыть при остановке сервера
 
 
 async def handle_settings(session: AgentSession, kind: str, data: dict, emit, http) -> None:
@@ -57,6 +60,7 @@ async def handle_settings(session: AgentSession, kind: str, data: dict, emit, ht
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=30, max_msg_size=8 * 1024 * 1024)
     await ws.prepare(request)
+    request.app[SOCKETS].add(ws)
 
     async def emit(event: dict) -> None:
         if not ws.closed:
@@ -116,6 +120,7 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
             await emit({"type": "reset_done"})
 
     session.interrupt()
+    request.app[SOCKETS].discard(ws)
     return ws
 
 
@@ -171,12 +176,83 @@ async def health(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "product": config.PRODUCT_NAME, "model": config.LLM_MODEL})
 
 
+def _panel_auth(handler):
+    async def wrapped(request: web.Request) -> web.Response:
+        if not auth.check(request.headers.get("X-Agent-Token")):
+            return web.json_response({"ok": False, "error": "нет доступа: неверный токен"}, status=401)
+        try:
+            return web.json_response({"ok": True, **(await handler(request) or {})})
+        except (local_model.LocalModelError, bases.BaseError) as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    return wrapped
+
+
+async def _body(request: web.Request) -> dict:
+    return await request.json() if request.can_read_body else {}
+
+
+async def panel_status(_request):
+    return local_model.manager.status()
+
+
+async def panel_model_action(request):
+    action = request.match_info["action"]
+    data = await _body(request)
+    m = local_model.manager
+    if action == "download":
+        m.start_download(data.get("preset") or local_model.settings()["preset"])
+    elif action == "cancel":
+        m.cancel_download()
+    elif action == "start":
+        if data.get("preset"):
+            local_model.save_settings({"preset": data["preset"]})
+        asyncio.create_task(_start_quietly(data.get("preset")))  # загрузка в память — до минуты, панель опрашивает статус
+    elif action == "stop":
+        await m.stop()
+    elif action == "settings":
+        local_model.save_settings(data)
+    else:
+        raise local_model.LocalModelError(f"Неизвестное действие {action}")
+    return m.status()
+
+
+async def panel_bases(_request):
+    return {"bases": bases.list_bases(), "jobs": bases.jobs()}
+
+
+async def panel_bases_add(request):
+    data = await _body(request)
+    bases.add_base(data.get("path", ""), data.get("title", ""), data.get("user", ""))
+    return await panel_bases(request)
+
+
+async def panel_export(request):
+    data = await _body(request)
+    bases.start_export(data.get("base_id", ""))
+    return await panel_bases(request)
+
+
+async def _start_quietly(preset):
+    try:
+        await local_model.manager.start(preset)
+    except local_model.LocalModelError as exc:
+        log.warning("запуск модели: %s", exc)
+
+
 async def _on_startup(app: web.Application) -> None:
     files.cleanup_old(config.UPLOAD_TTL_HOURS)
     app[HTTP] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_read=600))
+    app[IDLE] = asyncio.create_task(local_model.manager.idle_watch())
+
+
+async def _on_shutdown(app: web.Application) -> None:
+    for ws in list(app[SOCKETS]):
+        await ws.close(code=aiohttp.WSCloseCode.GOING_AWAY, message=b"server shutdown")
 
 
 async def _on_cleanup(app: web.Application) -> None:
+    app[IDLE].cancel()
+    await local_model.manager.stop()  # приложение закрыли — модель не должна остаться висеть в памяти
     await app[HTTP].close()
 
 
@@ -189,7 +265,15 @@ def make_app() -> web.Application:
     app.router.add_get("/ui.js", _static("ui.js", "application/javascript"))
     app.router.add_get("/ui.css", _static("ui.css", "text/css"))
     app.router.add_get("/dev", _static("dev.html", "text/html"))
+    app.router.add_get("/panel", _static("panel.html", "text/html"))
+    app.router.add_get("/panel/api/status", _panel_auth(panel_status))
+    app.router.add_post("/panel/api/model/{action}", _panel_auth(panel_model_action))
+    app.router.add_get("/panel/api/bases", _panel_auth(panel_bases))
+    app.router.add_post("/panel/api/bases/add", _panel_auth(panel_bases_add))
+    app.router.add_post("/panel/api/bases/export", _panel_auth(panel_export))
     app.on_startup.append(_on_startup)
+    app[SOCKETS] = set()
+    app.on_shutdown.append(_on_shutdown)
     app.on_cleanup.append(_on_cleanup)
     return app
 
@@ -197,7 +281,9 @@ def make_app() -> web.Application:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     auth.token()  # создать токен при первом запуске, а не при первом подключении
-    web.run_app(make_app(), host=config.HOST, port=config.PORT)
+    # Остановка не должна ждать открытые чаты минуту: приложение в трее гасит сервер при выходе,
+    # а вместе с ним должна уйти и модель.
+    web.run_app(make_app(), host=config.HOST, port=config.PORT, shutdown_timeout=3)
 
 
 if __name__ == "__main__":

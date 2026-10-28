@@ -4,3 +4,7 @@ server/logs/
 __pycache__/
 server/sources.json
 server/evals/*.local.json
+app/src-tauri/target/
+app/src-tauri/gen/
+app/node_modules/
+dist/

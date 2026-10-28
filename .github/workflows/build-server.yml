@@ -1,0 +1,45 @@
+name: build-server
+# Сборка сервера одним файлом для Windows и macOS — артефакты запуска, при теге v* — релиз.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: onec-agent-server-windows
+            binary: dist/onec-agent-server.exe
+          - os: macos-latest
+            artifact: onec-agent-server-macos
+            binary: dist/onec-agent-server
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r server/requirements.txt pyinstaller
+      - name: Тесты
+        run: |
+          pip install pytest
+          cd server && python -m pytest -q
+      - name: Сборка
+        shell: bash
+        run: |
+          cd server && PYTHON=python ./build-standalone.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+      - name: Релиз
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.binary }}

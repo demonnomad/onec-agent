@@ -26,6 +26,7 @@ def test_behavior_rules():
 def test_behavior_answer_rules():
     assert check_behavior({"must_ask": True}, [], "Какие товары и цены?") == []
     assert check_behavior({"must_ask": True}, [], "Готово.") == ["нет уточняющего вопроса"]
+    assert check_behavior({"must_ask": True}, [], "Уточните, пожалуйста, по какому счёту показать остаток.") == []
     assert check_behavior({"answer_any": ["не могу", "нельзя"]}, [], "Удалить не могу") == []
     assert check_behavior({"answer_none": ["не заполнен"]}, [], "Реквизит не заполнен")
 
@@ -39,3 +40,20 @@ def test_suite_variants_need_detect(tmp_path, monkeypatch):
     (tmp_path / "Конф.черновик.json").write_text(json.dumps({"cases": []}), "utf-8")  # без detect — не вариант
     assert [v["file"] for v in evals.suite_variants("Конф")] == ["Конф.demo.json"]
     assert evals.load_cases("Конф") == [{"id": "общий"}]
+
+
+def test_answer_all_requires_every_pattern():
+    assert check_behavior({"answer_all": ["Павел", "Мария"]}, [], "Павел или Мария?") == []
+    assert check_behavior({"answer_all": ["Павел", "Мария"]}, [], "Павел?") == ["в ответе нет: «Мария»"]
+
+
+def test_zero_reference_accepts_negative_wording():
+    for answer in ("Счетов-фактур на аванс не зарегистрировано.", "Авансовых счетов-фактур не выставлялось",
+                   "В сентябре таких документов не найдено"):
+        assert check([0.0], answer)[0], answer
+
+
+def test_expect_args_requires_argument_in_call():
+    checks = {"expect_args": [{"tool": "object_find", "has": "filters"}]}
+    assert check_behavior(checks, ["object_find"], "", [("object_find", {"text": "", "filters": {"Контрагент": "Альфа"}})]) == []
+    assert check_behavior(checks, ["object_find"], "", [("object_find", {"text": "Альфа"})]) == ["object_find не вызван с filters"]
